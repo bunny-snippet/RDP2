@@ -1,114 +1,463 @@
-name: RDP
+# Save as .github/workflows/optimum11-rdp.yml in your GitHub repository.
+# Required repository secrets: TAILSCALE_AUTH_KEY and RDP_PASSWORD.
+# Your connecting PC must use the same Tailscale network.
+# Germany IP requires an existing Germany Tailscale exit node you can use.
+# This installs your custom Optimum 11 ISO in a KVM guest, not on your PC.
+# GitHub nested VMs are experimental; total job duration cannot exceed 6 hours.
+# No Windows activation or Windows driver Test Mode changes are made.
+
+name: Optimum 11 - Browser RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      image_url:
+        description: 'Direct Optimum 11 Pro ISO or .7z download URL (not a download webpage)'
+        required: true
+        type: string
+        default: 'https://pixeldrain.com/api/file/MyER6Fta?download'
+      image_sha256:
+        description: 'Optional SHA-256 of the downloaded ISO/archive'
+        required: false
+        type: string
+      germany_exit_node:
+        description: 'Name or Tailscale IP of an available Germany exit node'
+        required: false
+        type: string
+      country_mode:
+        description: 'Germany needs an existing exit node; Runner country uses the assigned GitHub IP'
+        required: true
+        type: choice
+        default: 'Germany (exit node)'
+        options:
+          - 'Runner country'
+          - 'Germany (exit node)'
+      session_minutes:
+        description: 'RDP time after installation; the entire job still has a 6-hour limit'
+        required: true
+        type: choice
+        default: '240'
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '300'
+
+permissions: {}
+
+concurrency:
+  group: optimum11-rdp-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  optimum11:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Validate settings
+        env:
+          IMAGE_URL: ${{ inputs.image_url }}
+          IMAGE_SHA256: ${{ inputs.image_sha256 }}
+          GERMANY_EXIT_NODE: ${{ inputs.germany_exit_node }}
+          COUNTRY_MODE: ${{ inputs.country_mode }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, sys
+          from urllib.parse import urlsplit
+          url = urlsplit(os.environ['IMAGE_URL'])
+          if url.scheme != 'https' or not url.hostname or url.username or url.password:
+              sys.exit('image_url must be a public HTTPS download URL.')
+          checksum = os.environ.get('IMAGE_SHA256', '')
+          if checksum and not re.fullmatch(r'[0-9a-fA-F]{64}', checksum):
+              sys.exit('image_sha256 must contain exactly 64 hexadecimal characters.')
+          if not os.environ.get('TAILSCALE_AUTH_KEY'):
+              sys.exit('Add the TAILSCALE_AUTH_KEY repository secret first.')
+          if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' and not os.environ.get('GERMANY_EXIT_NODE', '').strip():
+              sys.exit('Supply an existing Germany Tailscale exit node name/IP. YAML cannot create a German IP.')
+          password = os.environ.get('RDP_PASSWORD', '')
+          if not 12 <= len(password) <= 64 or any(ord(c) < 32 for c in password):
+              sys.exit('RDP_PASSWORD must be 12-64 characters without control characters.')
+          if not all((re.search(r'[A-Z]', password), re.search(r'[a-z]', password),
+                      re.search(r'[0-9]', password), re.search(r'[^A-Za-z0-9]', password))):
+              sys.exit('RDP_PASSWORD needs uppercase, lowercase, a number and a symbol.')
+          PY
+          echo "VM_ROOT=$RUNNER_TEMP/optimum11" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/optimum11"/{media,storage,oem}
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
+      - name: Prepare runner and check hardware acceleration
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != 'github-hosted' ]]; then
+            echo 'This workflow is intended for a disposable GitHub-hosted runner.' >&2
+            exit 1
+          fi
+          if [[ ! -c /dev/kvm ]]; then
+            echo 'KVM is unavailable on this runner. Slow software emulation is disabled.' >&2
+            exit 1
+          fi
+          if ! grep -qw sse4_2 /proc/cpuinfo; then
+            echo 'This CPU does not expose SSE4.2, required by Optimum 11 24H2.' >&2
+            exit 1
+          fi
+          # Remove unused SDKs only on this disposable runner to make room for the VM.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup; do
+            if [[ -d "$sdk" && ! -L "$sdk" ]]; then
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends p7zip-full cpu-checker curl
+          sudo kvm-ok
+          free_bytes=$(df -B1 --output=avail "$VM_ROOT" | tail -n1 | tr -d ' ')
+          if (( free_bytes < 40 * 1024 * 1024 * 1024 )); then
+            echo 'At least 40 GiB of free host storage is needed for installation.' >&2
+            exit 1
+          fi
+          available_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+          if (( available_kib >= 12 * 1024 * 1024 )); then
+            echo 'VM_RAM=8G' >> "$GITHUB_ENV"
+          elif (( available_kib >= 6 * 1024 * 1024 )); then
+            echo 'VM_RAM=4G' >> "$GITHUB_ENV"
+          else
+            echo 'Not enough host memory for the browser VM.' >&2
+            exit 1
+          fi
+          cores=$(nproc)
+          if (( cores >= 4 )); then cores=3; else cores=2; fi
+          echo "VM_CORES=$cores" >> "$GITHUB_ENV"
+
+      - name: Download Optimum 11 Pro installation media
+        timeout-minutes: 30
+        env:
+          IMAGE_URL: ${{ inputs.image_url }}
+          IMAGE_SHA256: ${{ inputs.image_sha256 }}
+        run: |
+          set -euo pipefail
+          download="$VM_ROOT/media/download.bin"
+          curl --fail --location --silent --show-error --retry 3 --connect-timeout 30 \
+            --max-time 1500 --output "$download" "$IMAGE_URL"
+          if [[ -n "$IMAGE_SHA256" ]]; then
+            printf '%s  %s\n' "$IMAGE_SHA256" "$download" | sha256sum --check --status
+          fi
+          7z l -slt "$download" </dev/null > "$VM_ROOT/media/listing.txt"
+          if grep -Eq '^Type = (Udf|Iso)$' "$VM_ROOT/media/listing.txt"; then
+            mv -- "$download" "$VM_ROOT/media/custom.iso"
+          elif grep -q '^Type = 7z$' "$VM_ROOT/media/listing.txt"; then
+            mkdir -p "$VM_ROOT/media/extracted"
+            7z e -y "$download" "-o$VM_ROOT/media/extracted" '*.iso' </dev/null
+            mapfile -d '' isos < <(find "$VM_ROOT/media/extracted" -maxdepth 1 -type f -iname '*.iso' -print0)
+            if (( ${#isos[@]} != 1 )); then
+              echo 'The archive must contain exactly one Optimum 11 Pro ISO.' >&2
               exit 1
+            fi
+            mv -- "${isos[0]}" "$VM_ROOT/media/custom.iso"
+            rm -- "$download"
+          else
+            echo 'The download is not an ISO or .7z archive. Use a direct file URL.' >&2
+            exit 1
+          fi
+          test -s "$VM_ROOT/media/custom.iso"
+          7z l -slt "$VM_ROOT/media/custom.iso" </dev/null > "$VM_ROOT/media/iso-listing.txt"
+          grep -Eqi '^Path = sources[/\\]install\.(wim|esd)$' "$VM_ROOT/media/iso-listing.txt" || {
+            echo 'No Windows installation image found in the ISO.' >&2
+            exit 1
           }
+          # There is no fallback download of a different Windows OS.
 
-      - name: Install Tailscale
+      - name: Connect to Tailscale
+        timeout-minutes: 10
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          GERMANY_EXIT_NODE: ${{ inputs.germany_exit_node }}
+          COUNTRY_MODE: ${{ inputs.country_mode }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          set -euo pipefail
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+            -o "$VM_ROOT/tailscale.gpg"
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+            -o "$VM_ROOT/tailscale.list"
+          sudo install -m 0644 "$VM_ROOT/tailscale.gpg" /usr/share/keyrings/tailscale-archive-keyring.gpg
+          sudo install -m 0644 "$VM_ROOT/tailscale.list" /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tailscale
+          sudo systemctl enable --now tailscaled
+          exit_flags=()
+          if [[ "$COUNTRY_MODE" == 'Germany (exit node)' ]]; then
+            exit_flags=(--exit-node="$GERMANY_EXIT_NODE" --exit-node-allow-lan-access)
+          fi
+          sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" \
+            --hostname="optimum11-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --accept-dns=false "${exit_flags[@]}" --timeout=60s
+          ts_ip=$(sudo tailscale ip -4)
+          [[ "$ts_ip" =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "TAILSCALE_IP=$ts_ip" >> "$GITHUB_ENV"
 
-      - name: Establish Tailscale Connection
+      - name: Show the browser IP country
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          country = 'Unavailable'
+          public_ip = 'Unavailable'
+          try:
+              request = Request('https://ipapi.co/json/', headers={'User-Agent': 'Optimum11-RDP'})
+              with urlopen(request, timeout=15) as response:
+                  location = json.load(response)
+              country = location.get('country_name') or 'Unavailable'
+              public_ip = location.get('ip') or 'Unavailable'
+          except Exception:
+              print('The IP location service is unavailable; the workflow will continue.')
+          # Geolocation is approximate and this does not change the country.
+          country = str(country).replace('\n', ' ').replace('\r', ' ')[:100]
+          public_ip = str(public_ip).replace('\n', ' ').replace('\r', ' ')[:100]
+          print('Browser IP country (approximate): ' + country)
+          print('Public internet IP: ' + public_ip)
+          Path(os.environ['VM_ROOT'], 'ip-country.txt').write_text(country)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('Browser IP country (approximate): ' + country + '\n\n')
+          PY
+
+      - name: Prepare Firefox and Windows setup
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error --retry 3 --max-time 300 \
+            'https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=en-US' \
+            --output "$VM_ROOT/oem/firefox-setup.exe"
+          cat > "$VM_ROOT/oem/install.bat" <<'BAT'
+          @echo off
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\OEM\configure.ps1"
+          exit /b %errorlevel%
+          BAT
+          cat > "$VM_ROOT/oem/configure.ps1" <<'PS'
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content -LiteralPath 'C:\OEM\callback.json' -Raw | ConvertFrom-Json
+          $report = @{ status = 'failed'; message = 'Setup did not complete.' }
+          try {
+              $windows = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+              if ([int]$windows.CurrentBuildNumber -lt 22000 -or $windows.EditionID -notlike 'Professional*') {
+                  throw 'The installation must be Windows 11 Pro. Check your Optimum 11 ISO.'
+              }
+              $terminal = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+              $rdpTcp = "$terminal\WinStations\RDP-Tcp"
+              Set-ItemProperty $terminal -Name fDenyTSConnections -Value 0
+              Set-ItemProperty $rdpTcp -Name UserAuthentication -Value 1
+              Set-ItemProperty $rdpTcp -Name SecurityLayer -Value 2
+              Set-Service TermService -StartupType Automatic
+              Start-Service TermService
+              Set-Service MpsSvc -StartupType Automatic
+              Start-Service MpsSvc
+              Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+              Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue |
+                  Enable-NetFirewallRule
+              if (-not (Get-NetFirewallRule -Name 'Optimum11-RDP' -ErrorAction SilentlyContinue)) {
+                  New-NetFirewallRule -Name 'Optimum11-RDP' -DisplayName 'Optimum 11 RDP' `
+                      -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 | Out-Null
+              }
+              $installer = 'C:\OEM\firefox-setup.exe'
+              $signature = Get-AuthenticodeSignature -LiteralPath $installer
+              if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Mozilla') {
+                  throw 'The Firefox installer signature could not be verified.'
+              }
+              $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+              if ($process.ExitCode -ne 0) { throw "Firefox installation failed: $($process.ExitCode)" }
+              $firefox = "$env:ProgramFiles\Mozilla Firefox\firefox.exe"
+              if (-not (Test-Path -LiteralPath $firefox)) { throw 'Firefox was not installed.' }
+              $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+              $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$desktop\Firefox.lnk")
+              $shortcut.TargetPath = $firefox
+              $shortcut.Save()
+              $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+              Set-ItemProperty $winlogon -Name AutoAdminLogon -Value '0'
+              Remove-ItemProperty $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue
+              if (-not (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded) {
+                  throw 'The guest RDP listener is not ready.'
+              }
+              $location = $null
+              foreach ($attempt in 1..5) {
+                  try {
+                      $location = Invoke-RestMethod -Uri 'https://ipapi.co/json/' -TimeoutSec 20
+                      if ($location.country_code) { break }
+                  } catch { Start-Sleep -Seconds 3 }
+              }
+              if ($config.requiredCountry -eq 'DE' -and (-not $location -or $location.country_code -ne 'DE')) {
+                  throw 'The browser VM could not verify a Germany IP. Check the Germany exit node.'
+              }
+              $country = if ($location.country_code -match '^[A-Z]{2}$') { $location.country_code } else { 'Unknown' }
+              $report = @{ status = 'ready'; browser = 'Firefox'; country_code = $country;
+                           windows_build = $windows.CurrentBuildNumber }
+          } catch {
+              $report.message = $_.Exception.Message
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          $delivered = $false
+          foreach ($attempt in 1..10) {
+              try {
+                  Invoke-RestMethod -Uri $config.url -Method Post -ContentType 'application/json' `
+                      -Body ($report | ConvertTo-Json -Compress) -TimeoutSec 10 | Out-Null
+                  $delivered = $true
+                  break
+              } catch { Start-Sleep -Seconds 3 }
+          }
+          if (-not $delivered -or $report.status -ne 'ready') { exit 1 }
+          PS
+
+      - name: Start the Optimum 11 VM
+        env:
+          PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          USERNAME: RDP
+          COUNTRY_MODE: ${{ inputs.country_mode }}
+        run: |
+          set -euo pipefail
+          sudo systemctl start docker
+          docker network inspect bridge > "$VM_ROOT/docker-network.json"
+          export CALLBACK_IP
+          CALLBACK_IP=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["IPAM"]["Config"][0]["Gateway"])' "$VM_ROOT/docker-network.json")
+          export CALLBACK_TOKEN
+          CALLBACK_TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          echo "::add-mask::$CALLBACK_TOKEN"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['VM_ROOT'])
+          url = 'http://{}:18089/{}'.format(os.environ['CALLBACK_IP'], os.environ['CALLBACK_TOKEN'])
+          country = 'DE' if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' else None
+          (root / 'oem' / 'callback.json').write_text(json.dumps({'url': url, 'requiredCountry': country}), encoding='utf-8')
+          PY
+          cat > "$VM_ROOT/callback-server.py" <<'PY'
+          import hmac, json, os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from pathlib import Path
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+              def do_POST(self):
+                  if not hmac.compare_digest(self.path, '/' + os.environ['CALLBACK_TOKEN']):
+                      self.send_error(403)
+                      return
+                  try:
+                      size = int(self.headers.get('Content-Length', '0'))
+                      if not 0 < size <= 8192:
+                          raise ValueError()
+                      report = json.loads(self.rfile.read(size))
+                      if report.get('status') not in ('ready', 'failed'):
+                          raise ValueError()
+                      report_file = Path(os.environ['VM_ROOT'], 'guest-report.json')
+                      temporary = report_file.with_suffix('.tmp')
+                      temporary.write_text(json.dumps(report))
+                      temporary.replace(report_file)
+                  except (ValueError, TypeError, AttributeError):
+                      self.send_error(400)
+                      return
+                  self.send_response(204)
+                  self.end_headers()
+          HTTPServer((os.environ['CALLBACK_IP'], 18089), Handler).serve_forever()
+          PY
+          nohup python3 "$VM_ROOT/callback-server.py" > "$VM_ROOT/callback.log" 2>&1 &
+          echo "CALLBACK_PID=$!" >> "$GITHUB_ENV"
+          docker run --detach --name optimum11 --stop-timeout 120 \
+            --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN \
+            --publish "$TAILSCALE_IP:3389:3389/tcp" \
+            --publish "$TAILSCALE_IP:3389:3389/udp" \
+            --publish "$TAILSCALE_IP:8006:8006/tcp" \
+            --mount "type=bind,source=$VM_ROOT/media/custom.iso,target=/custom.iso,readonly" \
+            --mount "type=bind,source=$VM_ROOT/storage,target=/storage" \
+            --mount "type=bind,source=$VM_ROOT/oem,target=/oem,readonly" \
+            --env USERNAME --env PASSWORD --env "RAM_SIZE=$VM_RAM" \
+            --env "CPU_CORES=$VM_CORES" --env DISK_SIZE=64G --env DISK_FMT=qcow2 \
+            --env KVM=Y --env EDITION=pro --env AUTOLOGIN=Y \
+            --env WIDTH=1280 --env HEIGHT=720 \
+            dockurr/windows@sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30
+          echo "Installation monitor (Tailscale required): http://$TAILSCALE_IP:8006"
+          echo "VM resources: $VM_CORES virtual CPUs / $VM_RAM RAM"
+          {
+            echo '## Optimum 11 installation'
+            echo "Monitor: http://$TAILSCALE_IP:8006 (same Tailscale network required)"
+            echo 'Wait for the guest RDP and Firefox checks before connecting.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for Windows RDP and Firefox
+        timeout-minutes: 60
+        env:
+          COUNTRY_MODE: ${{ inputs.country_mode }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 3300))
+          while (( SECONDS < deadline )); do
+            if [[ -f "$VM_ROOT/guest-report.json" ]]; then
+              python3 - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          report = json.loads(Path(os.environ['VM_ROOT'], 'guest-report.json').read_text())
+          if report.get('status') != 'ready':
+              # Do not print guest-controlled text as GitHub workflow commands.
+              sys.exit('Guest setup failed. Check the installation monitor and C:\\OEM\\configure.ps1.')
+          if report.get('browser') != 'Firefox':
+              sys.exit('The browser readiness check failed.')
+          if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' and report.get('country_code') != 'DE':
+              sys.exit('The guest Germany IP check failed.')
+          print('The guest confirmed Firefox and an RDP listener.')
+          print('Guest IP country (approximate):', report.get('country_code', 'Unknown'))
+          PY
+              exit 0
+            fi
+            running=$(docker inspect --format '{{.State.Running}}' optimum11)
+            if [[ "$running" != 'true' ]]; then
+              echo 'The VM stopped during installation. Check the installation monitor.' >&2
               exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
+            fi
+            echo 'Optimum 11 is installing; waiting for the Windows/browser report.'
+            sleep 30
+          done
+          echo 'Setup did not finish in 55 minutes. Inspect the monitor for ISO compatibility issues.' >&2
+          exit 1
+
+      - name: RDP connection details and session
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          set -euo pipefail
+          echo "Address: $TAILSCALE_IP:3389"
+          echo 'Username: RDP'
+          echo 'Password: the value you saved in the RDP_PASSWORD repository secret.'
+          echo 'Browser: Firefox (desktop shortcut)'
+          guest_country=$(python3 -c 'import json,sys; country=json.load(open(sys.argv[1])).get("country_code", "Unknown"); print(country if len(country)==2 and country.isupper() and country.isalpha() else "Unknown")' "$VM_ROOT/guest-report.json")
+          echo "Browser IP country (guest IP check): $guest_country"
+          echo 'Use Cancel workflow to end this session.'
+          {
+            echo '## RDP ready'
+            echo "Address: $TAILSCALE_IP:3389"
+            echo 'Username: RDP'
+            echo 'Password: your RDP_PASSWORD repository secret'
+            echo 'Firefox is installed. Connect with Remote Desktop while Tailscale is on.'
+            echo "The browser VM public IP country (approximate): $guest_country"
+            echo 'The complete job has a 6-hour maximum; disk data is temporary.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          deadline=$((SECONDS + SESSION_MINUTES * 60))
+          while (( SECONDS < deadline )); do
+            [[ "$(docker inspect --format '{{.State.Running}}' optimum11)" == 'true' ]] || exit 1
+            available=$(df -B1 --output=avail "$VM_ROOT" | tail -n1 | tr -d ' ')
+            if (( available < 1024 * 1024 * 1024 )); then
+              echo 'Host disk space is critically low; ending the session.' >&2
               exit 1
-          }
-          Write-Host "TCP connectivity successful!"
+            fi
+            echo "RDP session active: $(date -u +%H:%M:%S) UTC"
+            sleep 60
+          done
 
-      - name: Maintain Connection
+      - name: Stop VM and disconnect Tailscale
+        if: always()
+        timeout-minutes: 5
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
-          }
-
+          docker stop --time 120 optimum11 >/dev/null 2>&1 || true
+          docker rm optimum11 >/dev/null 2>&1 || true
+          if [[ -n "${CALLBACK_PID:-}" ]]; then kill "$CALLBACK_PID" 2>/dev/null || true; fi
+          if command -v tailscale >/dev/null; then sudo tailscale logout || true; fi
