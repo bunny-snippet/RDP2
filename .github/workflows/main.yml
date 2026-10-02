@@ -79,6 +79,8 @@ jobs:
               sys.exit('image_sha256 must contain exactly 64 hexadecimal characters.')
           if not os.environ.get('TAILSCALE_AUTH_KEY'):
               sys.exit('Add the TAILSCALE_AUTH_KEY repository secret first.')
+          if not os.environ['TAILSCALE_AUTH_KEY'].startswith('tskey-auth-'):
+              sys.exit('TAILSCALE_AUTH_KEY must be a Tailscale Auth key (tskey-auth-), not an API key.')
           if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' and not os.environ.get('GERMANY_EXIT_NODE', '').strip():
               sys.exit('Supply an existing Germany Tailscale exit node name/IP. YAML cannot create a German IP.')
           password = os.environ.get('RDP_PASSWORD', '')
@@ -90,6 +92,41 @@ jobs:
           PY
           echo "VM_ROOT=$RUNNER_TEMP/optimum11" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/optimum11"/{media,storage,oem}
+
+      - name: Connect to Tailscale
+        timeout-minutes: 10
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          GERMANY_EXIT_NODE: ${{ inputs.germany_exit_node }}
+          COUNTRY_MODE: ${{ inputs.country_mode }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+            -o "$VM_ROOT/tailscale.gpg"
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+            -o "$VM_ROOT/tailscale.list"
+          sudo install -m 0644 "$VM_ROOT/tailscale.gpg" /usr/share/keyrings/tailscale-archive-keyring.gpg
+          sudo install -m 0644 "$VM_ROOT/tailscale.list" /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tailscale
+          sudo systemctl enable --now tailscaled
+          exit_flags=()
+          if [[ "$COUNTRY_MODE" == 'Germany (exit node)' ]]; then
+            exit_flags=(--exit-node="$GERMANY_EXIT_NODE" --exit-node-allow-lan-access)
+          fi
+          if ! sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" \
+            --hostname="optimum11-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --accept-dns=false "${exit_flags[@]}" --timeout=60s > "$VM_ROOT/tailscale-auth.log" 2>&1; then
+            if grep -Eqi 'invalid key|expired|not valid' "$VM_ROOT/tailscale-auth.log"; then
+              echo 'Tailscale rejected TAILSCALE_AUTH_KEY. Replace the repository secret with a fresh Auth key.' >&2
+            else
+              echo 'Tailscale connection failed. Check auth key approval, tailnet access and exit node settings.' >&2
+            fi
+            exit 1
+          fi
+          ts_ip=$(sudo tailscale ip -4)
+          [[ "$ts_ip" =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "TAILSCALE_IP=$ts_ip" >> "$GITHUB_ENV"
 
       - name: Prepare runner and check hardware acceleration
         run: |
@@ -170,34 +207,6 @@ jobs:
             exit 1
           }
           # There is no fallback download of a different Windows OS.
-
-      - name: Connect to Tailscale
-        timeout-minutes: 10
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          GERMANY_EXIT_NODE: ${{ inputs.germany_exit_node }}
-          COUNTRY_MODE: ${{ inputs.country_mode }}
-        run: |
-          set -euo pipefail
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
-            -o "$VM_ROOT/tailscale.gpg"
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
-            -o "$VM_ROOT/tailscale.list"
-          sudo install -m 0644 "$VM_ROOT/tailscale.gpg" /usr/share/keyrings/tailscale-archive-keyring.gpg
-          sudo install -m 0644 "$VM_ROOT/tailscale.list" /etc/apt/sources.list.d/tailscale.list
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends tailscale
-          sudo systemctl enable --now tailscaled
-          exit_flags=()
-          if [[ "$COUNTRY_MODE" == 'Germany (exit node)' ]]; then
-            exit_flags=(--exit-node="$GERMANY_EXIT_NODE" --exit-node-allow-lan-access)
-          fi
-          sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" \
-            --hostname="optimum11-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --accept-dns=false "${exit_flags[@]}" --timeout=60s
-          ts_ip=$(sudo tailscale ip -4)
-          [[ "$ts_ip" =~ ^100\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-          echo "TAILSCALE_IP=$ts_ip" >> "$GITHUB_ENV"
 
       - name: Show the browser IP country
         run: |
