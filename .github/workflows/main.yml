@@ -1,4 +1,4 @@
-# Save as .github/workflows/optimum11-rdp.yml in your GitHub repository.
+# Save as .github/workflows/main.yml in your GitHub repository.
 # Required repository secrets: TAILSCALE_AUTH_KEY and RDP_PASSWORD.
 # Your connecting PC must use the same Tailscale network.
 # Germany IP requires an existing Germany Tailscale exit node you can use.
