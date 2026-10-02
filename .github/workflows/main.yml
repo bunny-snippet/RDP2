@@ -151,8 +151,8 @@ jobs:
             mv -- "$download" "$VM_ROOT/media/custom.iso"
           elif grep -q '^Type = 7z$' "$VM_ROOT/media/listing.txt"; then
             mkdir -p "$VM_ROOT/media/extracted"
-            7z e -y -ssc- "$download" "-o$VM_ROOT/media/extracted" '*.iso' </dev/null
-            mapfile -d '' isos < <(find "$VM_ROOT/media/extracted" -maxdepth 1 -type f -iname '*.iso' -print0)
+            7z x -y "$download" "-o$VM_ROOT/media/extracted" </dev/null
+            mapfile -d '' isos < <(find "$VM_ROOT/media/extracted" -type f -iname '*.iso' -print0)
             if (( ${#isos[@]} != 1 )); then
               echo 'The archive must contain exactly one Optimum 11 Pro ISO.' >&2
               exit 1
