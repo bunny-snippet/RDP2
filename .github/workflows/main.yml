@@ -42,6 +42,11 @@ on:
           - '120'
           - '240'
           - '300'
+      verify_only:
+        description: 'Verify Windows setup without opening a remote session'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -66,6 +71,7 @@ jobs:
           COUNTRY_MODE: ${{ inputs.country_mode }}
           TAILSCALE_AUTH_KEY: ${{ secrets.TAIL }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -77,9 +83,10 @@ jobs:
           checksum = os.environ.get('IMAGE_SHA256', '')
           if checksum and not re.fullmatch(r'[0-9a-fA-F]{64}', checksum):
               sys.exit('image_sha256 must contain exactly 64 hexadecimal characters.')
-          if not os.environ.get('TAILSCALE_AUTH_KEY'):
+          verify_only = os.environ.get('VERIFY_ONLY') == 'true'
+          if not verify_only and not os.environ.get('TAILSCALE_AUTH_KEY'):
               sys.exit('Add the TAIL repository secret first.')
-          if not os.environ['TAILSCALE_AUTH_KEY'].startswith('tskey-auth-'):
+          if not verify_only and not os.environ['TAILSCALE_AUTH_KEY'].startswith('tskey-auth-'):
               sys.exit('TAIL must be a Tailscale Auth key (tskey-auth-), not an API key.')
           if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' and not os.environ.get('GERMANY_EXIT_NODE', '').strip():
               sys.exit('Supply an existing Germany Tailscale exit node name/IP. YAML cannot create a German IP.')
@@ -94,6 +101,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/optimum11"/{media,storage,oem}
 
       - name: Connect to Tailscale
+        if: ${{ !inputs.verify_only }}
         timeout-minutes: 10
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAIL }}
@@ -415,11 +423,12 @@ jobs:
           PY
           nohup python3 "$VM_ROOT/callback-server.py" > "$VM_ROOT/callback.log" 2>&1 &
           echo "CALLBACK_PID=$!" >> "$GITHUB_ENV"
+          publish_ip="${TAILSCALE_IP:-127.0.0.1}"
           docker run --detach --name optimum11 --stop-timeout 120 \
             --device /dev/kvm --device /dev/net/tun --cap-add NET_ADMIN \
-            --publish "$TAILSCALE_IP:3389:3389/tcp" \
-            --publish "$TAILSCALE_IP:3389:3389/udp" \
-            --publish "$TAILSCALE_IP:8006:8006/tcp" \
+            --publish "$publish_ip:3389:3389/tcp" \
+            --publish "$publish_ip:3389:3389/udp" \
+            --publish "$publish_ip:8006:8006/tcp" \
             --mount "type=bind,source=$VM_ROOT/media/custom.iso,target=/custom.iso,readonly" \
             --mount "type=bind,source=$VM_ROOT/storage,target=/storage" \
             --mount "type=bind,source=$VM_ROOT/oem,target=/oem,readonly" \
@@ -428,11 +437,11 @@ jobs:
             --env KVM=Y --env EDITION=pro --env AUTOLOGIN=Y \
             --env WIDTH=1280 --env HEIGHT=720 \
             dockurr/windows@sha256:0cff9eb0e7aee9953e55bc682852ca4fdca233145a58ae1ec94f0b0c01a2ed30
-          echo "Installation monitor (Tailscale required): http://$TAILSCALE_IP:8006"
+          echo "Installation monitor (runner local in verification mode): http://$publish_ip:8006"
           echo "VM resources: $VM_CORES virtual CPUs / $VM_RAM RAM"
           {
             echo '## Optimum 11 installation'
-            echo "Monitor: http://$TAILSCALE_IP:8006 (same Tailscale network required)"
+            echo "Monitor: http://$publish_ip:8006 (runner local in verification mode)"
             echo 'Wait for the guest RDP and Firefox checks before connecting.'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -476,6 +485,7 @@ jobs:
           exit 1
 
       - name: RDP connection details and session
+        if: ${{ !inputs.verify_only }}
         env:
           SESSION_MINUTES: ${{ inputs.session_minutes }}
         run: |
@@ -510,6 +520,16 @@ jobs:
             echo "RDP session active: $(date -u +%H:%M:%S) UTC"
             sleep 60
           done
+
+      - name: Windows verification result
+        if: ${{ inputs.verify_only && success() }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path(os.environ['VM_ROOT'], 'guest-report.json').read_text())
+          print('Verified guest setup: ' + json.dumps(report, ensure_ascii=True))
+          PY
 
       - name: Stop VM and disconnect Tailscale
         if: always()
