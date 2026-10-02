@@ -357,7 +357,10 @@ jobs:
           } catch {
               $report.message = $_.Exception.Message
           }
-          $report | ConvertTo-Json | Set-Content -LiteralPath 'C:\OEM\configure-report.json' -Encoding UTF8
+          # Report logging must not prevent delivery of the readiness callback.
+          try {
+              $report | ConvertTo-Json | Set-Content -LiteralPath "$env:PUBLIC\Documents\optimum11-report.json" -Encoding UTF8
+          } catch { }
           $delivered = $false
           foreach ($attempt in 1..10) {
               try {
@@ -454,13 +457,13 @@ jobs:
           deadline=$((SECONDS + 3300))
           while (( SECONDS < deadline )); do
             if [[ -f "$VM_ROOT/guest-report.json" ]]; then
-              python3 - <<'PY'
+              if python3 - <<'PY'
           import json, os, sys
           from pathlib import Path
           report = json.loads(Path(os.environ['VM_ROOT'], 'guest-report.json').read_text())
           if report.get('status') != 'ready':
               # JSON escaping keeps guest-controlled newlines out of workflow commands.
-              sys.exit('Guest setup failed: ' + json.dumps(str(report.get('message', 'Unknown setup error.'))))
+              sys.exit('Guest setup needs attention: ' + json.dumps(str(report.get('message', 'Unknown setup error.'))))
           if report.get('browser') != 'Firefox':
               sys.exit('The browser readiness check failed.')
           if not report.get('timezone_iana') or not report.get('timezone_windows') or not report.get('home_location'):
@@ -471,7 +474,9 @@ jobs:
           print('Guest IP country (approximate):', report.get('country_code', 'Unknown'))
           print('Windows timezone:', report['timezone_windows'])
           PY
-              exit 0
+              then
+                exit 0
+              fi
             fi
             running=$(docker inspect --format '{{.State.Running}}' optimum11)
             if [[ "$running" != 'true' ]]; then
