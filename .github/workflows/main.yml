@@ -282,8 +282,11 @@ jobs:
               Set-ItemProperty $rdpTcp -Name SecurityLayer -Value 2
               Set-Service TermService -StartupType Automatic
               Start-Service TermService
-              Set-Service MpsSvc -StartupType Automatic
-              Start-Service MpsSvc
+              $firewallService = Get-Service MpsSvc
+              if ($firewallService.StartType -ne 'Automatic') {
+                  Set-Service MpsSvc -StartupType Automatic
+              }
+              if ($firewallService.Status -ne 'Running') { Start-Service MpsSvc }
               Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
               Get-NetFirewallRule -Name 'RemoteDesktop*' -ErrorAction SilentlyContinue |
                   Enable-NetFirewallRule
@@ -346,6 +349,7 @@ jobs:
           } catch {
               $report.message = $_.Exception.Message
           }
+          $report | ConvertTo-Json | Set-Content -LiteralPath 'C:\OEM\configure-report.json' -Encoding UTF8
           $delivered = $false
           foreach ($attempt in 1..10) {
               try {
@@ -446,8 +450,8 @@ jobs:
           from pathlib import Path
           report = json.loads(Path(os.environ['VM_ROOT'], 'guest-report.json').read_text())
           if report.get('status') != 'ready':
-              # Do not print guest-controlled text as GitHub workflow commands.
-              sys.exit('Guest setup failed. Check the installation monitor and C:\\OEM\\configure.ps1.')
+              # JSON escaping keeps guest-controlled newlines out of workflow commands.
+              sys.exit('Guest setup failed: ' + json.dumps(str(report.get('message', 'Unknown setup error.'))))
           if report.get('browser') != 'Firefox':
               sys.exit('The browser readiness check failed.')
           if not report.get('timezone_iana') or not report.get('timezone_windows') or not report.get('home_location'):
