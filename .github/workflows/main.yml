@@ -233,6 +233,25 @@ jobs:
           curl --fail --location --silent --show-error --retry 3 --max-time 300 \
             'https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=en-US' \
             --output "$VM_ROOT/oem/firefox-setup.exe"
+          python3 - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+          base = 'https://raw.githubusercontent.com/unicode-org/cldr/release-48/common/'
+          def read_xml(path):
+              with urlopen(Request(base + path, headers={'User-Agent': 'Optimum11-RDP'}), timeout=30) as response:
+                  return ET.fromstring(response.read())
+          zones = {'UTC': 'UTC', 'Etc/UTC': 'UTC', 'Etc/GMT': 'UTC'}
+          for entry in read_xml('supplemental/windowsZones.xml').iter('mapZone'):
+              for name in entry.attrib['type'].split():
+                  zones[name] = entry.attrib['other']
+          for entry in read_xml('bcp47/timezone.xml').iter('type'):
+              aliases = entry.attrib.get('alias', '').split()
+              windows_id = next((zones[name] for name in aliases if name in zones), None)
+              if windows_id:
+                  zones.update({name: windows_id for name in aliases})
+          Path(os.environ['VM_ROOT'], 'oem', 'windows-timezones.json').write_text(json.dumps(zones), encoding='utf-8')
+          PY
           cat > "$VM_ROOT/oem/install.bat" <<'BAT'
           @echo off
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\OEM\configure.ps1"
@@ -283,17 +302,37 @@ jobs:
                   throw 'The guest RDP listener is not ready.'
               }
               $location = $null
-              foreach ($attempt in 1..5) {
+              foreach ($attempt in 1..3) {
                   try {
                       $location = Invoke-RestMethod -Uri 'https://ipapi.co/json/' -TimeoutSec 20
-                      if ($location.country_code) { break }
-                  } catch { Start-Sleep -Seconds 3 }
+                      if ($location.country_code -and $location.timezone) { break }
+                  } catch { }
+                  try {
+                      $fallback = Invoke-RestMethod -Uri 'https://ipwho.is/' -TimeoutSec 20
+                      if ($fallback.success -and $fallback.country_code -and $fallback.timezone.id) {
+                          $location = [pscustomobject]@{ country_code = $fallback.country_code; timezone = $fallback.timezone.id }
+                          break
+                      }
+                  } catch { }
+                  Start-Sleep -Seconds 3
+              }
+              if (-not $location -or $location.country_code -notmatch '^[A-Z]{2}$' -or -not $location.timezone) {
+                  throw 'Public IP location could not be detected; timezone setup cannot be verified.'
               }
               if ($config.requiredCountry -eq 'DE' -and (-not $location -or $location.country_code -ne 'DE')) {
                   throw 'The browser VM could not verify a Germany IP. Check the Germany exit node.'
               }
+              $zoneMap = Get-Content -LiteralPath 'C:\OEM\windows-timezones.json' -Raw | ConvertFrom-Json
+              $zoneProperty = $zoneMap.PSObject.Properties[[string]$location.timezone]
+              if (-not $zoneProperty) { throw 'The detected location has no Windows timezone mapping.' }
+              Set-TimeZone -Id $zoneProperty.Value
+              if ((Get-TimeZone).Id -ne $zoneProperty.Value) { throw 'The Windows timezone did not apply.' }
+              $region = New-Object System.Globalization.RegionInfo -ArgumentList $location.country_code
+              Set-WinHomeLocation -GeoId $region.GeoId
               $country = if ($location.country_code -match '^[A-Z]{2}$') { $location.country_code } else { 'Unknown' }
               $report = @{ status = 'ready'; browser = 'Firefox'; country_code = $country;
+                           timezone_iana = $location.timezone; timezone_windows = (Get-TimeZone).Id;
+                           home_location = (Get-WinHomeLocation).GeoId;
                            windows_build = $windows.CurrentBuildNumber }
           } catch {
               $report.message = $_.Exception.Message
@@ -402,10 +441,13 @@ jobs:
               sys.exit('Guest setup failed. Check the installation monitor and C:\\OEM\\configure.ps1.')
           if report.get('browser') != 'Firefox':
               sys.exit('The browser readiness check failed.')
+          if not report.get('timezone_iana') or not report.get('timezone_windows') or not report.get('home_location'):
+              sys.exit('The location/timezone readiness check failed.')
           if os.environ['COUNTRY_MODE'] == 'Germany (exit node)' and report.get('country_code') != 'DE':
               sys.exit('The guest Germany IP check failed.')
           print('The guest confirmed Firefox and an RDP listener.')
           print('Guest IP country (approximate):', report.get('country_code', 'Unknown'))
+          print('Windows timezone:', report['timezone_windows'])
           PY
               exit 0
             fi
@@ -431,6 +473,8 @@ jobs:
           echo 'Browser: Firefox (desktop shortcut)'
           guest_country=$(python3 -c 'import json,sys; country=json.load(open(sys.argv[1])).get("country_code", "Unknown"); print(country if len(country)==2 and country.isupper() and country.isalpha() else "Unknown")' "$VM_ROOT/guest-report.json")
           echo "Browser IP country (guest IP check): $guest_country"
+          guest_timezone=$(python3 -c 'import json,sys; zone=json.load(open(sys.argv[1]))["timezone_windows"]; print(str(zone).replace("\n", " ").replace("\r", " ")[:100])' "$VM_ROOT/guest-report.json")
+          echo "Windows timezone: $guest_timezone"
           echo 'Use Cancel workflow to end this session.'
           {
             echo '## RDP ready'
@@ -439,6 +483,7 @@ jobs:
             echo 'Password: your RDP_PASSWORD repository secret'
             echo 'Firefox is installed. Connect with Remote Desktop while Tailscale is on.'
             echo "The browser VM public IP country (approximate): $guest_country"
+            echo "Windows timezone: $guest_timezone"
             echo 'The complete job has a 6-hour maximum; disk data is temporary.'
           } >> "$GITHUB_STEP_SUMMARY"
           deadline=$((SECONDS + SESSION_MINUTES * 60))
